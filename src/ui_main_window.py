@@ -32,9 +32,21 @@ class UiMainWindow:
         layout.addWidget(self.main_splitter)
         window.setCentralWidget(central)
         self.file_dock = QtWidgets.QDockWidget("Files and graphs", window)
+        self.file_dock.setObjectName("files_and_graphs_dock")
         self.file_tree = QtWidgets.QTreeView()
         self.file_tree.setUniformRowHeights(True)
         self.file_tree.setAlternatingRowColors(True)
+        self.file_tree.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.file_tree.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.file_tree.setToolTip(
+            "Ctrl+right-click adds rows to multi-selection. The context "
+            "menu selects ranges. Double-click a source or graph row, or "
+            "choose Edit multi-selection, to edit all selected rows."
+        )
         self.file_tree.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
             | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
@@ -44,7 +56,8 @@ class UiMainWindow:
             QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock
         )
         self.trace_dock = QtWidgets.QDockWidget("Traces", window)
-        self.trace_table = QtWidgets.QTableWidget(0, 10)
+        self.trace_dock.setObjectName("traces_dock")
+        self.trace_table = QtWidgets.QTableWidget(0, 12)
         self.trace_table.setHorizontalHeaderLabels(
             [
                 "Trace",
@@ -57,6 +70,8 @@ class UiMainWindow:
                 "Log Axis",
                 "Grid",
                 "Title",
+                "Options",
+                "V lock",
             ]
         )
         self.trace_dock.setWidget(self.trace_table)
@@ -68,6 +83,9 @@ class UiMainWindow:
         vm = window.menuBar().addMenu("View")
         hm = window.menuBar().addMenu("Help")
         self.open_action = self._action(fm, "Open...", "Ctrl+O")
+        self.open_advanced_action = self._action(
+            fm, "Open advanced...", "Ctrl+Shift+O"
+        )
         self.delete_file_action = self._action(
             fm, "Remove selected file", "Ctrl+D"
         )
@@ -117,7 +135,10 @@ class UiMainWindow:
         )
         self.fit_action = self._action(vm, "Fit active trace", "F")
         self.display_settings_action = self._action(
-            tm, "Display and axis settings...", "Ctrl+Alt+D"
+            tm, "Title and axis settings...", "O"
+        )
+        self.display_settings_action.setToolTip(
+            "Open title and axis settings for the active trace (O)"
         )
         self.toggle_files_action = self._check(vm, "File tree", True)
         self.toggle_traces_action = self._check(vm, "Trace list", True)
@@ -148,6 +169,9 @@ class UiMainWindow:
         )
         self.marker_a_action = self._action(vm, "Place marker A", "A")
         self.marker_b_action = self._action(vm, "Place marker B", "B")
+        self.point_marker_action = self._action(
+            vm, "Place numbered point marker", "M"
+        )
         self.clear_ab_action = self._action(
             vm, "Clear A/B markers", "Ctrl+Alt+B"
         )

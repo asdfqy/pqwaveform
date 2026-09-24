@@ -7,3 +7,4 @@ ipython>=8.0
 qtconsole>=5.6
 ipykernel>=6.0
 jupyter_client>=8.0
+json5>=0.9

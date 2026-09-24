@@ -355,6 +355,171 @@ class WaveformTracker:
         self.result_reference = result_position
         self.result.show()
 
+class PointMarker:
+    """A numbered marker constrained to sampled or interpolated curves."""
+
+    def __init__(
+        self,
+        plot,
+        number,
+        x_value,
+        y_value,
+        curves=None,
+        interpolation=False,
+    ):
+        self.plot = plot
+        self.number = int(number)
+        self.x_value = float(x_value)
+        self.y_value = float(y_value)
+        self.curves = list(curves or [])
+        self.interpolation = bool(interpolation)
+        self.engineering = False
+        self._updating = False
+        self.point = pg.TargetItem(
+            pos=(self.x_value, self.y_value),
+            size=13,
+            symbol="o",
+            pen=pg.mkPen("#ff9f1c", width=2),
+            brush=pg.mkBrush(20, 20, 20),
+            movable=True,
+        )
+        self.point.setZValue(210)
+        self.label = DraggableTextItem(anchor=(0, 1), color="#ff9f1c")
+        self.label.setZValue(220)
+        self.plot.addItem(self.point, ignoreBounds=True)
+        self.plot.addItem(self.label, ignoreBounds=True)
+        self.point.sigPositionChanged.connect(self.update_from_item)
+        self.snap_to_curve(reset_label=True)
+
+    @property
+    def name(self):
+        return f"M{self.number}"
+
+    def set_font_size(self, font_size):
+        """Use the same marker font setting as A/B and H/V labels."""
+        font = QtGui.QFont()
+        font.setPointSize(int(font_size))
+        self.label.setFont(font)
+
+    def set_tracking(self, curves, interpolation):
+        """Update visible curves and the sampled/interpolated tracking mode."""
+        self.curves = list(curves or [])
+        self.interpolation = bool(interpolation)
+        self.snap_to_curve(reset_label=False)
+
+    def _candidate_points(self, x_value, y_value):
+        """Yield curve-constrained candidates near a proposed position."""
+        for curve in self.curves:
+            x_values, y_values = curve.getData()
+            if x_values is None or y_values is None:
+                continue
+            x_array = np.asarray(x_values, dtype=float)
+            y_array = np.asarray(y_values, dtype=float)
+            valid = np.flatnonzero(np.isfinite(x_array) & np.isfinite(y_array))
+            if valid.size == 0:
+                continue
+            if self.interpolation and valid.size > 1:
+                order = np.argsort(x_array[valid])
+                sorted_x = x_array[valid][order]
+                sorted_y = y_array[valid][order]
+                unique_x, unique_indices = np.unique(
+                    sorted_x, return_index=True
+                )
+                unique_y = sorted_y[unique_indices]
+                if unique_x.size > 1:
+                    candidate_x = float(
+                        np.clip(x_value, unique_x[0], unique_x[-1])
+                    )
+                    candidate_y = float(
+                        np.interp(candidate_x, unique_x, unique_y)
+                    )
+                    yield candidate_x, candidate_y
+                    continue
+            for index in valid:
+                yield float(x_array[index]), float(y_array[index])
+
+    def _nearest_curve_point(self, x_value, y_value):
+        """Choose the visually nearest valid point in plot scene pixels."""
+        view_box = self.plot.getViewBox()
+        proposed = view_box.mapViewToScene(
+            QtCore.QPointF(float(x_value), float(y_value))
+        )
+        best = None
+        best_distance = np.inf
+        for candidate_x, candidate_y in self._candidate_points(
+            x_value, y_value
+        ):
+            scene = view_box.mapViewToScene(
+                QtCore.QPointF(candidate_x, candidate_y)
+            )
+            distance = (
+                (scene.x() - proposed.x()) ** 2
+                + (scene.y() - proposed.y()) ** 2
+            )
+            if distance < best_distance:
+                best_distance = distance
+                best = candidate_x, candidate_y
+        return best
+
+    def snap_to_curve(self, reset_label=False):
+        """Snap to a visible graph according to the trace cursor mode."""
+        snapped = self._nearest_curve_point(self.x_value, self.y_value)
+        if snapped is None:
+            snapped = self.x_value, self.y_value
+        old_x, old_y = self.x_value, self.y_value
+        self.x_value, self.y_value = snapped
+        self._updating = True
+        self.point.setPos(self.x_value, self.y_value)
+        self._updating = False
+        if reset_label:
+            self.label.setPos(self.x_value, self.y_value)
+        else:
+            self.label.moveBy(
+                self.x_value - old_x, self.y_value - old_y
+            )
+        self.update_label()
+
+    def update_from_item(self, *_args):
+        """Snap a dragged target back onto the nearest visible graph."""
+        if self._updating:
+            return
+        position = self.point.pos()
+        old_x, old_y = self.x_value, self.y_value
+        snapped = self._nearest_curve_point(position.x(), position.y())
+        if snapped is None:
+            snapped = old_x, old_y
+        self.x_value, self.y_value = snapped
+        self._updating = True
+        self.point.setPos(self.x_value, self.y_value)
+        self._updating = False
+        self.label.moveBy(
+            self.x_value - old_x, self.y_value - old_y
+        )
+        self.update_label()
+
+    def update_label(self):
+        x_text = display_text(self.x_value, self.engineering)
+        y_text = display_text(self.y_value, self.engineering)
+        self.label.setText(f"{self.name}\nx {x_text}\ny {y_text}")
+        self.label.show()
+
+    def set_engineering(self, enabled):
+        self.engineering = bool(enabled)
+        self.update_label()
+
+    def state(self):
+        return {
+            "number": self.number,
+            "position": [self.x_value, self.y_value],
+            "label": [self.label.pos().x(), self.label.pos().y()],
+            "alignment": self.label.alignment,
+        }
+
+    def remove(self):
+        self.plot.removeItem(self.point)
+        self.plot.removeItem(self.label)
+
+
 class IntersectionMarker:
     """Horizontal or vertical line with graph intersection points and labels."""
 

@@ -63,75 +63,102 @@ class EngineeringAxisItem(pg.AxisItem):
 
 
 class DisplaySettingsDialog(QtWidgets.QDialog):
-    """Edit axis names, units, engineering mode, fonts, and marker offset."""
+    """Edit display values and select values applied across the active tab."""
 
     def __init__(self, trace, parent=None):
-        """Create controls initialized from a trace."""
         super().__init__(parent)
         self.setWindowTitle(f"Display settings: {trace.name}")
-        form = QtWidgets.QFormLayout(self)
-        self.x_name = QtWidgets.QLineEdit(trace.x_name)
-        self.x_unit = QtWidgets.QLineEdit(trace.x_unit)
-        self.y_name = QtWidgets.QLineEdit(trace.y_name)
-        self.y_unit = QtWidgets.QLineEdit(trace.y_unit)
-        self.title = QtWidgets.QLineEdit(trace.title)
-        self.background = QtWidgets.QComboBox()
-        self.background.addItems(["Black", "White"])
-        self.background.setCurrentText(trace.background.title())
-        self.engineering = QtWidgets.QCheckBox()
-        self.engineering.setChecked(trace.engineering_axes)
-        self.axis_label_size = QtWidgets.QSpinBox()
-        self.axis_tick_size = QtWidgets.QSpinBox()
-        self.marker_label_size = QtWidgets.QSpinBox()
-        self.legend_font_size = QtWidgets.QSpinBox()
-        for widget, value in (
-            (self.axis_label_size, trace.axis_label_size),
-            (self.axis_tick_size, trace.axis_tick_size),
-            (self.marker_label_size, trace.marker_label_size),
-            (self.legend_font_size, trace.legend_font_size),
+        self.resize(920, 600)
+        self.setMinimumWidth(840)
+        layout = QtWidgets.QVBoxLayout(self)
+        info = QtWidgets.QLabel(
+            "Check Apply to tab beside any option that should be copied "
+            "to every trace in the current tab."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        grid = QtWidgets.QGridLayout()
+        grid.addWidget(QtWidgets.QLabel("Option"), 0, 0)
+        grid.addWidget(QtWidgets.QLabel("Value"), 0, 1)
+        apply_header = QtWidgets.QLabel("Tab")
+        apply_header.setToolTip("Apply checked properties to this tab")
+        grid.addWidget(apply_header, 0, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 3)
+        grid.setColumnMinimumWidth(2, 44)
+        self.controls = {}
+        self.apply_to_tab = {}
+
+        def add(row, key, label, widget):
+            box = QtWidgets.QCheckBox()
+            box.setChecked(False)
+            box.setToolTip(f"Apply {label.lower()} to all traces in this tab")
+            self.controls[key] = widget
+            self.apply_to_tab[key] = box
+            grid.addWidget(QtWidgets.QLabel(label), row, 0)
+            grid.addWidget(widget, row, 1)
+            grid.addWidget(box, row, 2, alignment=QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        from PyQt6 import QtCore
+        text_values = (
+            ("title", "Plot title", trace.title),
+            ("x_name", "X axis name", trace.x_name),
+            ("x_unit", "X unit", trace.x_unit),
+            ("y_name", "Y axis name", trace.y_name),
+            ("y_unit", "Y unit", trace.y_unit),
+        )
+        row = 1
+        for key, label, value in text_values:
+            add(row, key, label, QtWidgets.QLineEdit(value))
+            row += 1
+        background = QtWidgets.QComboBox()
+        background.addItems(["Black", "White"])
+        background.setCurrentText(trace.background.title())
+        add(row, "background", "Plot background", background)
+        row += 1
+        engineering = QtWidgets.QCheckBox()
+        engineering.setChecked(trace.engineering_axes)
+        add(row, "engineering_axes", "Engineering SI ticks", engineering)
+        row += 1
+        for key, label, value in (
+            ("axis_label_size", "Axis label font", trace.axis_label_size),
+            ("axis_tick_size", "Axis tick font", trace.axis_tick_size),
+            ("marker_label_size", "Marker font", trace.marker_label_size),
+            ("legend_font_size", "Legend font", trace.legend_font_size),
         ):
+            widget = QtWidgets.QSpinBox()
             widget.setRange(6, 30)
             widget.setValue(value)
-        self.marker_offset = QtWidgets.QDoubleSpinBox()
-        self.marker_offset.setRange(0, 1)
-        self.marker_offset.setSingleStep(0.02)
-        self.marker_offset.setValue(trace.marker_offset)
-        for label, widget in (
-            ("Plot title", self.title),
-            ("X axis name", self.x_name),
-            ("X unit", self.x_unit),
-            ("Y axis name", self.y_name),
-            ("Y unit", self.y_unit),
-            ("Plot background", self.background),
-            ("Engineering SI ticks", self.engineering),
-            ("Axis label font", self.axis_label_size),
-            ("Axis tick font", self.axis_tick_size),
-            ("Marker font", self.marker_label_size),
-            ("Legend font", self.legend_font_size),
-            ("Delta label offset", self.marker_offset),
-        ):
-            form.addRow(label, widget)
+            add(row, key, label, widget)
+            row += 1
+        offset = QtWidgets.QDoubleSpinBox()
+        offset.setRange(0, 1)
+        offset.setSingleStep(0.02)
+        offset.setValue(trace.marker_offset)
+        add(row, "marker_offset", "Delta label offset", offset)
+        layout.addLayout(grid)
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
 
     def values(self):
-        """Return edited settings."""
-        return {
-            "title": self.title.text(),
-            "x_name": self.x_name.text(),
-            "x_unit": self.x_unit.text(),
-            "y_name": self.y_name.text(),
-            "y_unit": self.y_unit.text(),
-            "background": self.background.currentText().lower(),
-            "engineering_axes": self.engineering.isChecked(),
-            "axis_label_size": self.axis_label_size.value(),
-            "axis_tick_size": self.axis_tick_size.value(),
-            "marker_label_size": self.marker_label_size.value(),
-            "legend_font_size": self.legend_font_size.value(),
-            "marker_offset": self.marker_offset.value(),
+        """Return edited values and keys explicitly shared with the tab."""
+        values = {}
+        for key, widget in self.controls.items():
+            if isinstance(widget, QtWidgets.QLineEdit):
+                value = widget.text()
+            elif isinstance(widget, QtWidgets.QComboBox):
+                value = widget.currentText().lower()
+            elif isinstance(widget, QtWidgets.QCheckBox):
+                value = widget.isChecked()
+            else:
+                value = widget.value()
+            values[key] = value
+        shared = {
+            key for key, box in self.apply_to_tab.items() if box.isChecked()
         }
+        return values, shared

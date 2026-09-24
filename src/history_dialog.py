@@ -7,6 +7,7 @@ class HistoryDialog(QtWidgets.QDialog):
 
     SAVE_CURRENT = 2
     DELETE_SELECTED = 3
+    OVERWRITE_SELECTED = 4
 
     def __init__(self, entries, commands=None, traces=None, parent=None):
         super().__init__(parent)
@@ -15,7 +16,17 @@ class HistoryDialog(QtWidgets.QDialog):
         self.traces = list(traces or [])
         self.selected_indices = []
         self.selected_index = None
+        self.entries_changed = False
         self.trace_code_editors = {}
+        self.current_traces = list(self.traces)
+        self.current_sections = {
+            "before_traces": "",
+            "traces": {
+                str(trace_id): "" for trace_id, _name in self.current_traces
+            },
+        }
+        self.displaying_current_structure = True
+        self.current_source_code = "\n".join(self.commands)
         self.setWindowTitle("Waveform history")
         self.resize(980, 760)
         layout = QtWidgets.QVBoxLayout(self)
@@ -52,28 +63,39 @@ class HistoryDialog(QtWidgets.QDialog):
         )
         self.code_tabs.addTab(self.source_code, "Source")
         self.code_tabs.addTab(self.pre_trace_code, "Before traces")
-        for trace_id, trace_name in self.traces:
-            editor = self._editor(
-                f"Executed with trace {trace_id} active: {trace_name}"
-            )
-            self.trace_code_editors[trace_id] = editor
-            self.code_tabs.addTab(editor, f"Trace {trace_id}")
+        self._rebuild_trace_editors(self.current_traces, {})
         assignment = QtWidgets.QHBoxLayout()
         assignment.addWidget(QtWidgets.QLabel("Copy selected source text to:"))
         self.assignment_target = QtWidgets.QComboBox()
         self.assignment_target.addItem("Before traces", None)
-        for trace_id, trace_name in self.traces:
-            self.assignment_target.addItem(
-                f"Trace {trace_id}: {trace_name}", trace_id
-            )
+        self._refresh_assignment_targets(self.current_traces)
         self.assign_button = QtWidgets.QPushButton("Copy selection")
         self.assign_button.clicked.connect(self.copy_selection)
+        self.current_session_button = QtWidgets.QPushButton(
+            "Show current session code"
+        )
+        self.current_session_button.setToolTip(
+            "Rebuild the Python editor tabs for the currently running "
+            "session and restore their unsaved contents"
+        )
+        self.current_session_button.clicked.connect(
+            self.restore_current_trace_structure
+        )
         assignment.addWidget(self.assignment_target, 1)
         assignment.addWidget(self.assign_button)
+        assignment.addWidget(self.current_session_button)
         layout.addLayout(assignment)
         buttons = QtWidgets.QDialogButtonBox()
         self.save_button = buttons.addButton(
             "Save current", QtWidgets.QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.overwrite_button = buttons.addButton(
+            "Overwrite selected",
+            QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        self.overwrite_button.setEnabled(False)
+        self.overwrite_button.setToolTip(
+            "Replace the selected state with the current project state"
         )
         self.delete_button = buttons.addButton(
             "Delete selected",
@@ -88,10 +110,9 @@ class HistoryDialog(QtWidgets.QDialog):
         self.search.textChanged.connect(self.refresh)
         self.table.itemSelectionChanged.connect(self.select_rows)
         self.table.doubleClicked.connect(self.restore)
-        self.save_button.clicked.connect(lambda: self.done(self.SAVE_CURRENT))
-        self.delete_button.clicked.connect(
-            lambda: self.done(self.DELETE_SELECTED)
-        )
+        self.save_button.clicked.connect(self.save_current)
+        self.overwrite_button.clicked.connect(self.overwrite_selected)
+        self.delete_button.clicked.connect(self.delete_selected)
         self.load_button.clicked.connect(self.restore)
         buttons.rejected.connect(self.reject)
         self.refresh()
@@ -101,6 +122,70 @@ class HistoryDialog(QtWidgets.QDialog):
         editor = QtWidgets.QPlainTextEdit()
         editor.setPlaceholderText(placeholder)
         return editor
+
+    def _refresh_assignment_targets(self, traces):
+        """Synchronize assignment choices with the visible trace editors."""
+        self.assignment_target.blockSignals(True)
+        self.assignment_target.clear()
+        self.assignment_target.addItem("Before traces", None)
+        for trace_id, trace_name in traces:
+            self.assignment_target.addItem(
+                f"Trace {trace_id}: {trace_name}", int(trace_id)
+            )
+        self.assignment_target.blockSignals(False)
+
+    def _rebuild_trace_editors(self, traces, sections):
+        """Build code tabs from the selected history state's trace model."""
+        while self.code_tabs.count() > 2:
+            widget = self.code_tabs.widget(2)
+            self.code_tabs.removeTab(2)
+            widget.deleteLater()
+        self.trace_code_editors = {}
+        trace_sections = sections.get("traces", {})
+        for trace_id, trace_name in traces:
+            trace_id = int(trace_id)
+            editor = self._editor(
+                f"Executed with trace {trace_id} active: {trace_name}"
+            )
+            editor.setPlainText(trace_sections.get(str(trace_id), ""))
+            self.trace_code_editors[trace_id] = editor
+            self.code_tabs.addTab(
+                editor, f"Trace {trace_id}: {trace_name}"
+            )
+        if hasattr(self, "assignment_target"):
+            self._refresh_assignment_targets(traces)
+
+    @staticmethod
+    def _entry_traces(entry):
+        """Return ordered trace IDs and names captured by one entry."""
+        model = entry.get("model", {})
+        by_id = {
+            int(item["uid"]): item.get("name", f"Trace {item['uid']}")
+            for item in model.get("traces", [])
+        }
+        order = model.get("trace_order", list(by_id))
+        return [(int(trace_id), by_id.get(int(trace_id),
+                 f"Trace {trace_id}")) for trace_id in order]
+
+    def capture_current_editor_contents(self):
+        """Retain unsaved code while current-session editors are visible."""
+        if not self.displaying_current_structure:
+            return
+        self.current_source_code = self.source_code.toPlainText()
+        self.current_sections = self.code_sections()
+
+    def restore_current_trace_structure(self):
+        """Show current-session editors and retain all unsaved contents."""
+        self.capture_current_editor_contents()
+        self.source_code.setPlainText(self.current_source_code)
+        self.pre_trace_code.setPlainText(
+            self.current_sections.get("before_traces", "")
+        )
+        self._rebuild_trace_editors(
+            self.current_traces, self.current_sections
+        )
+        self.displaying_current_structure = True
+        self.code_tabs.setCurrentIndex(0)
 
     def copy_selection(self):
         """Append selected central source text to one code section."""
@@ -159,7 +244,13 @@ class HistoryDialog(QtWidgets.QDialog):
         self.table.resizeColumnToContents(0)
         self.table.resizeColumnToContents(1)
 
+    def save_current(self):
+        """Save with the current project's trace structure, not an old one."""
+        self.restore_current_trace_structure()
+        self.done(self.SAVE_CURRENT)
+
     def select_rows(self):
+        self.capture_current_editor_contents()
         rows = sorted({index.row() for index in self.table.selectedIndexes()})
         self.selected_indices = []
         for row in rows:
@@ -171,10 +262,55 @@ class HistoryDialog(QtWidgets.QDialog):
         self.selected_index = (
             self.selected_indices[0] if self.selected_indices else None
         )
+        self.overwrite_button.setEnabled(len(self.selected_indices) == 1)
         if self.selected_index is not None:
             entry = self.entries[self.selected_index]
             self.name.setText(entry.get("name", ""))
             self.description.setPlainText(entry.get("description", ""))
+            sections = entry.get("python_sections", {})
+            self.pre_trace_code.setPlainText(
+                sections.get("before_traces", "")
+            )
+            traces = self._entry_traces(entry)
+            self._rebuild_trace_editors(traces, sections)
+            self.displaying_current_structure = False
+            legacy = entry.get("ipython_code", "")
+            if isinstance(legacy, list):
+                legacy = "\n".join(legacy)
+            self.source_code.setPlainText(str(legacy or ""))
+
+    def overwrite_selected(self):
+        """Confirm replacement of one selected state with current data."""
+        if len(self.selected_indices) != 1:
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Overwrite history state",
+            "Replace the selected history state with the current project "
+            "configuration? This cannot be undone.",
+            QtWidgets.QMessageBox.StandardButton.Yes
+            | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.restore_current_trace_structure()
+            self.done(self.OVERWRITE_SELECTED)
+
+    def delete_selected(self):
+        """Delete selected rows while keeping the history dialog open."""
+        if not self.selected_indices:
+            return
+        selected = set(self.selected_indices)
+        self.entries[:] = [
+            entry for index, entry in enumerate(self.entries)
+            if index not in selected
+        ]
+        self.entries_changed = True
+        self.selected_indices = []
+        self.selected_index = None
+        self.name.clear()
+        self.description.clear()
+        self.refresh()
 
     def restore(self):
         if len(self.selected_indices) == 1:

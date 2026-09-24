@@ -33,6 +33,7 @@ class HelpDialog(QtWidgets.QDialog):
             "Shortcuts": """# Shortcuts
 
 - `Ctrl+O`: open data files
+- `Ctrl+Shift+O`: advanced open with parsing preview
 - `Ctrl+D`: remove the selected file or calculated graph
 - `Ctrl+T`: add a trace to the active tab
 - `Ctrl+Shift+T`: add a trace tab
@@ -48,8 +49,9 @@ class HelpDialog(QtWidgets.QDialog):
 - `H`: place a horizontal intersection marker at the mouse
 - `V`: place a vertical intersection marker at the mouse
 - `A`, `B`: place measurement markers
+- `M`: place the next movable numbered point marker
 - `Ctrl+Alt+B`: clear A/B markers only
-- `Ctrl+Alt+D`: open display and axis settings
+- `O`: open title and axis settings for the active trace
 - `Ctrl+E`: clear all markers in the active trace
 - `Backspace`: remove the selected H/V marker line
 - `Ctrl+S`: export the active trace
@@ -60,8 +62,8 @@ class HelpDialog(QtWidgets.QDialog):
 - `Ctrl+Shift+H`: open searchable JSON history states
 - `Ctrl+H`: horizontal A/B measurement layout
 - `Ctrl+V`: vertical A/B measurement layout
-- `Ctrl+mouse wheel`: horizontal-only zoom
-- `Ctrl+Shift+mouse wheel`: vertical-only zoom
+- `Ctrl+mouse wheel`: vertical-only zoom
+- `Ctrl+Shift+mouse wheel`: horizontal-only zoom
 - `Ctrl+Shift+A`: show all non-X columns of the selected file
 - `Ctrl+Shift+N`: hide all non-X columns of the selected file
 - `Ctrl+Q`: exit
@@ -70,6 +72,8 @@ class HelpDialog(QtWidgets.QDialog):
 """,
             "Overview": """# PQWaveForm
 
+Run `python pqwaveform.py --version` to print the installed version.
+
 PQWaveForm is a multi-trace waveform viewer based on **PyQt6**,
 **PyQtGraph**, and an embedded **IPython QtConsole**. Source columns and
 calculated graphs share plotting, styling, alias, and export facilities.
@@ -77,7 +81,7 @@ calculated graphs share plotting, styling, alias, and export facilities.
             "Getting started": """# Getting started
 
 1. Open data with **Ctrl+O**.
-2. Expand a full-width file row.
+2. Expand a full-width file row. New files do not enable Y automatically.
 3. Select one **X** column and one or more **Y** columns.
 4. Activate a trace by clicking its vertical label.
 5. Use the resizable IPython console for calculations.
@@ -97,10 +101,17 @@ QTreeView creates no persistent per-cell widgets, so files with hundreds of
 columns remain responsive. The compact first column starts with the numeric
 source-column index. Double-click Alias, LW, or LS to edit and double-click LC
 to choose a color. Ctrl+wheel over LW changes width by 0.5 and
-over LC cycles colors. X and Y are directly checkable.
+over LC cycles colors. Ctrl+right-click adds rows to a persistent multi-selection.
+The right-click Start/Stop commands add inclusive ranges; multiple ranges can be
+combined. Persistent multi-selected rows have a blue background and a diamond
+marker, clearly distinguishing them from the ordinary current row. Double-click a selectable row or choose **Edit multi-selection** from the RMB
+menu to open one dialog containing color, width, style, sample symbol, Y
+visibility, and calculated-graph deletion controls.
+Multi-selected calculated graphs can also be deleted together.
+X and Y are directly checkable.
 
 `LS` supports **Solid**, **Dash**, **Dot**, **Dash-dot**, and
-**Points only**. Points only draws a marker at every finite X/Y sample and
+**None**. Points only draws a marker at every finite X/Y sample and
 adds no connecting line. The LS dialog also offers **Show original
 measurement points**, which overlays actual samples on any line style.
 Alias and LW are editable by double-click or the edit key. Each loaded file
@@ -117,7 +128,7 @@ active trace. Each graph owns independent X/Y arrays and supports:
 - direct deletion in the tree
 - persistent visibility
 - line width or point size
-- five line styles, including points only
+- five line styles, including no connecting line
 - X selection, using the graph's Y array as source-curve X values
 
 Right-click a calculated graph to delete it, save it, or save its trace.
@@ -132,7 +143,11 @@ label activates a trace; double-clicking it opens display settings. Trace
 heights are manually adjustable with the splitter handles between plots.
 The Cursor cell selects Off, Sampled, or Interpolated tracking. Ctrl+H and
 Ctrl+V independently change the A/B layout. Compact Legend and Grid checkboxes
-and an editable Title column are also available. New
+and an editable Title column are also available. The Options column opens display
+settings. The compact V lock checkbox synchronizes vertical-marker X
+coordinates across locked traces in the same tab, independent of zoom.
+Every setting has an unchecked Apply-to-tab box for copying only
+that property to all traces in the active tab. New
 tabs own their traces, and closing a tab deletes its traces. **Clear traces**
 replaces all traces in the current tab with one empty trace.
 """,
@@ -270,6 +285,11 @@ alignment controls.
 Move the tracker near a visible curve and press **A** or **B**. Marker labels
 and the result label are draggable. The result displays `dx`, `dy`, `1/dx`,
 `1/dy`, and slope `k`. Optional interpolation tracks between finite samples.
+`M` places M1, M2, ... markers with X/Y labels. The marker snaps to the
+nearest visible graph. In Sampled mode it uses original samples; in
+Interpolated mode it follows the interpolated curve. Its label remains
+independently movable, uses the configured Marker font, and is stored in
+History.
 `H` and `V` immediately create movable intersection lines at the current mouse
 coordinate. Double-click or right-click a line to enter an exact value. Every
 intersection label uses the configured Marker font. **Ctrl+E** clears A/B and
@@ -295,8 +315,10 @@ span.
 **File > History states** searches, saves, and restores named states with short
 descriptions. The selector uses Date, Name, and Description columns. Dates use
 `YYYY-MM-DD HH:MM` and are searchable. Multiple rows can be selected and
-removed with **Delete selected**. The
+removed with **Delete selected**. Select one state and use **Overwrite
+selected** to replace it with the current configuration after confirmation. The
 default `pqwaveform_history.json` is in the current working
+source paths are stored relative to the history file directory; the
 directory. A state includes files, columns, graphs, axes, traces, tabs, ranges,
 Python code is stored as setup code and per-trace code. During restore,
 setup runs first. Each trace is then activated before its assigned code
@@ -310,7 +332,16 @@ To save a reproducible state:
 4. Copy graph-building commands into each matching trace code tab.
 5. Review every section and press **Save current**.
 
-Restore asks once before running code. Files and aliases are restored first.
+History files use JSON5, permit comments, and store multiline Python as readable
+line arrays. Restore shows the code review before session traces are built. The
+Selecting a history state rebuilds the trace-code tabs from that state's stored
+trace order and names, then loads all matching Python. Use **Show current
+session code** to return to the running project's trace tabs and verify or edit
+exactly what Save current or Overwrite selected will store. Unsaved editor
+contents are retained while switching between old and current sessions. The checked **Build traces stored in this history session** option keeps the normal
+workflow. Disable it when the reviewed code creates traces; saved trace settings
+are mapped to generated traces by unique name and then by order. Restore asks
+once before running code. Files and aliases are restored first.
 Each trace is created, activated, and its assigned code is executed. Saved
 graph metadata is applied before widgets and visual state is restored.
 This includes titles, legends, ranges,

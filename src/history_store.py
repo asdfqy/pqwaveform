@@ -1,7 +1,24 @@
 """JSON serialization for complete waveform-viewer history snapshots."""
 
 from dataclasses import asdict
-import json
+try:
+    import json5
+except ModuleNotFoundError:
+    import json as _json
+    import re as _re
+
+    class _Json5Fallback:
+        @staticmethod
+        def loads(text):
+            text = _re.sub(r"(?m)^\s*//.*$", "", text)
+            return _json.loads(text)
+
+        @staticmethod
+        def dumps(value, **kwargs):
+            kwargs.pop("quote_keys", None)
+            return _json.dumps(value, **kwargs)
+
+    json5 = _Json5Fallback()
 from pathlib import Path
 
 import numpy as np
@@ -25,8 +42,29 @@ def _json_value(value):
     return value
 
 
-def capture_model(model):
-    """Capture model-owned files, traces, tabs, styles, and graphs."""
+def _relative_path(filename, base_directory):
+    """Return a portable path relative to the history file directory."""
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    try:
+        return str(path.relative_to(base_directory))
+    except ValueError:
+        import os
+        return os.path.relpath(path, base_directory)
+
+
+def _resolved_path(filename, base_directory):
+    """Resolve relative history paths while accepting legacy absolutes."""
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = base_directory / path
+    return str(path.resolve())
+
+
+def capture_model(model, base_directory=None):
+    """Capture model state with portable paths relative to history."""
+    base = Path(base_directory or ".").expanduser().resolve()
     traces = []
     for trace_id in model.trace_order:
         trace = model.traces[trace_id]
@@ -60,6 +98,7 @@ def capture_model(model):
                     "line_style": graph.line_style,
                     "visible": graph.visible,
                     "show_points": graph.show_points,
+                    "marker_symbol": graph.marker_symbol,
                     "legend_name": graph.legend_name,
                     "selected_as_x": trace.x_graph_id == graph.uid,
                 }
@@ -72,7 +111,7 @@ def capture_model(model):
         "files": [
             {
                 "uid": data_file.uid,
-                "path": data_file.path,
+                "path": _relative_path(data_file.path, base),
                 "import_options": data_file.import_options,
             }
             for data_file in model.files.values()
@@ -87,8 +126,11 @@ def capture_model(model):
     }
 
 
-def restore_model(model, state):
-    """Restore files first, then exact trace and graph configuration."""
+def restore_model(
+    model, state, base_directory=None, build_saved_traces=True
+):
+    """Restore files and optionally the traces stored in the session."""
+    base = Path(base_directory or ".").expanduser().resolve()
     model.blockSignals(True)
     model.files.clear()
     model.traces.clear()
@@ -98,10 +140,25 @@ def restore_model(model, state):
         for key, value in item.get("import_options", {}).items():
             setattr(model.options, key, value)
         current_id = model.load_file(
-            item["path"], aliases_from_comment=False
+            _resolved_path(item["path"], base),
+            aliases_from_comment=False,
         )
         file_mapping[item["uid"]] = current_id
     model.traces.clear()
+    if not build_saved_traces:
+        model.trace_order = []
+        model.tabs = {0: "Tab 1"}
+        model.tab_order = [0]
+        model.active_tab_id = 0
+        model.next_trace_id = 0
+        model.active_trace_id = None
+        model.add_trace("Trace 0")
+        model.blockSignals(False)
+        model.files_changed.emit()
+        model.traces_changed.emit()
+        model.tabs_changed.emit()
+        model.aliases_changed.emit()
+        return
     model.trace_order = list(state.get("trace_order", []))
     for source_values in state.get("traces", []):
         values = dict(source_values)
@@ -147,20 +204,43 @@ def restore_model(model, state):
     model.aliases_changed.emit()
 
 
+def _multiline_to_json5(value):
+    """Represent multiline strings as readable JSON5 line arrays."""
+    if isinstance(value, str) and "\n" in value:
+        return {"$multiline": value.splitlines()}
+    if isinstance(value, dict):
+        return {key: _multiline_to_json5(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_multiline_to_json5(item) for item in value]
+    return value
+
+
+def _multiline_from_json5(value):
+    """Reconstruct multiline strings from the readable JSON5 form."""
+    if isinstance(value, dict) and set(value) == {"$multiline"}:
+        return "\n".join(value["$multiline"])
+    if isinstance(value, dict):
+        return {key: _multiline_from_json5(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_multiline_from_json5(item) for item in value]
+    return value
+
+
 def read_entries(filename=DEFAULT_HISTORY):
-    """Read a history file or return an empty list."""
+    """Read JSON5 history, including comments and legacy JSON files."""
     path = Path(filename)
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8")).get("states", [])
+    payload = json5.loads(path.read_text(encoding="utf-8"))
+    return _multiline_from_json5(payload).get("states", [])
 
 
 def write_entries(entries, filename=DEFAULT_HISTORY):
-    """Write named history entries as readable JSON."""
+    """Write commented JSON5 with readable multiline Python sections."""
+    payload = _multiline_to_json5(
+        _json_value({"version": 2, "states": entries})
+    )
     Path(filename).write_text(
-        json.dumps(
-            _json_value({"version": 1, "states": entries}),
-            indent=2,
-        ),
+        json5.dumps(payload, indent=2, quote_keys=True),
         encoding="utf-8",
     )

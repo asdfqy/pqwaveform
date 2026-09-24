@@ -22,6 +22,15 @@ class HistoryCodeDialog(QtWidgets.QDialog):
         )
         message.setWordWrap(True)
         layout.addWidget(message)
+        self.build_saved_traces = QtWidgets.QCheckBox(
+            "Build traces stored in this history session"
+        )
+        self.build_saved_traces.setChecked(True)
+        self.build_saved_traces.setToolTip(
+            "Disable when the reviewed Python code creates its own traces. "
+            "Saved trace settings are then mapped to generated traces."
+        )
+        layout.addWidget(self.build_saved_traces)
         tabs = QtWidgets.QTabWidget()
         layout.addWidget(tabs)
         before = QtWidgets.QPlainTextEdit()
@@ -42,6 +51,10 @@ class HistoryCodeDialog(QtWidgets.QDialog):
         run.clicked.connect(lambda: self.done(self.RUN_CODE))
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def restore_saved_traces(self):
+        """Return whether model-owned session traces should be built."""
+        return self.build_saved_traces.isChecked()
 
     def reviewed_sections(self):
         """Return all code after possible review edits."""

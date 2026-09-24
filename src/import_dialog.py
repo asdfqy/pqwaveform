@@ -111,3 +111,57 @@ class PlotExportDialog(QtWidgets.QDialog):
                 trace_ids.append(item.data(QtCore.Qt.ItemDataRole.UserRole))
         return (trace_ids, self.format.currentText().lower(),
                 self.background.currentText().lower())
+
+
+class AdvancedImportDialog(ImportSettingsDialog):
+    """Import settings with an immediate tabular preview."""
+
+    def __init__(self, options, filename, parent=None):
+        super().__init__(options, filename, "Review parsing before loading.", parent)
+        self.setWindowTitle("Open advanced")
+        self.resize(980, 720)
+        self.setMinimumSize(760, 560)
+        self.filename = filename
+        self.preview = QtWidgets.QTableWidget()
+        self.preview.setMinimumHeight(320)
+        self.layout().insertWidget(self.layout().count() - 1, self.preview)
+        for widget in (
+            self.separator, self.comment, self.header, self.skip_begin,
+            self.skip_end, self.x_column, self.y_columns,
+        ):
+            signal = getattr(widget, "textChanged", None)
+            if signal is None:
+                signal = widget.valueChanged
+            signal.connect(self.update_preview)
+        self.update_preview()
+
+    def update_preview(self, *_args):
+        """Parse a few records with current settings and show errors inline."""
+        import pandas as pd
+        try:
+            values = self.values()
+            header = None if values["dheader"] < 0 else values["dheader"]
+            frame = pd.read_csv(
+                self.filename,
+                sep=values["dseparator"],
+                comment=values["dcomment"] or None,
+                header=header,
+                skiprows=values["dskipbegin"],
+                engine="python",
+                nrows=20,
+                on_bad_lines="warn",
+            )
+            self.preview.setRowCount(len(frame))
+            self.preview.setColumnCount(len(frame.columns))
+            self.preview.setHorizontalHeaderLabels(map(str, frame.columns))
+            for row in range(len(frame)):
+                for column in range(len(frame.columns)):
+                    self.preview.setItem(
+                        row, column,
+                        QtWidgets.QTableWidgetItem(str(frame.iat[row, column])),
+                    )
+            self.preview.setToolTip("Preview of the first 20 parsed records")
+        except Exception as error:
+            self.preview.setRowCount(1)
+            self.preview.setColumnCount(1)
+            self.preview.setItem(0, 0, QtWidgets.QTableWidgetItem(str(error)))

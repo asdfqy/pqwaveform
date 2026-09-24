@@ -6,7 +6,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 
 HEADERS = ("Column", "Alias", "LC", "X", "Y", "LW", "LS")
-STYLE_NAMES = ("Solid", "Dash", "Dot", "Dash-dot", "Points only")
+STYLE_NAMES = ("Solid", "Dash", "Dot", "Dash-dot", "None")
 
 
 @dataclass
@@ -30,6 +30,7 @@ class FileGraphTreeModel(QtCore.QAbstractItemModel):
         self.project = project
         self.trace_id = project.active_trace_id
         self.root = TreeNode("root", (), "")
+        self.multi_selected = set()
         self.rebuild()
 
     def rebuild(self, trace_id=None):
@@ -119,6 +120,14 @@ class FileGraphTreeModel(QtCore.QAbstractItemModel):
                 flags |= QtCore.Qt.ItemFlag.ItemIsUserCheckable
         return flags
 
+    def set_multi_selection(self, payloads):
+        """Update persistent selection markers without resetting the tree."""
+        self.multi_selected = {tuple(value) for value in payloads}
+        if self.rowCount():
+            first = self.index(0, 0)
+            last = self.index(self.rowCount() - 1, self.columnCount() - 1)
+            self.dataChanged.emit(first, last)
+
     def data(self, index, role=QtCore.Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
@@ -126,6 +135,16 @@ class FileGraphTreeModel(QtCore.QAbstractItemModel):
         column = index.column()
         if role == QtCore.Qt.ItemDataRole.UserRole:
             return node.key
+        if (
+            role == QtCore.Qt.ItemDataRole.BackgroundRole
+            and tuple(node.key) in self.multi_selected
+        ):
+            return QtGui.QBrush(QtGui.QColor(70, 110, 170, 150))
+        if (
+            role == QtCore.Qt.ItemDataRole.ForegroundRole
+            and tuple(node.key) in self.multi_selected
+        ):
+            return QtGui.QBrush(QtGui.QColor("white"))
         if role == QtCore.Qt.ItemDataRole.ToolTipRole:
             return self._tooltip(node, column)
         if role == QtCore.Qt.ItemDataRole.FontRole and node.parent is self.root:
@@ -168,8 +187,12 @@ class FileGraphTreeModel(QtCore.QAbstractItemModel):
         if column == 0:
             if node.kind == "source":
                 _, file_id, source_column = node.key
-                label = self.project.files[file_id].labels[source_column]
-                return f"{source_column}: {label}"
+                data_file = self.project.files.get(file_id)
+                if data_file is None or source_column >= len(data_file.labels):
+                    return ""
+                label = data_file.labels[source_column]
+                prefix = "◆ " if tuple(node.key) in self.multi_selected else ""
+                return f"{prefix}{source_column}: {label}"
             return node.label
         style, graph = self._objects(node)
         if style is None:
@@ -210,19 +233,25 @@ class FileGraphTreeModel(QtCore.QAbstractItemModel):
 
     def _tooltip(self, node, column):
         if node.kind == "file":
-            return self.project.files[node.key[1]].path
+            data_file = self.project.files.get(node.key[1])
+            return data_file.path if data_file is not None else None
         if column == 2 and node.kind in ("source", "graph"):
             return (
-                "Double-click to choose a color; Ctrl+wheel cycles colors"
+                "Double-click to choose a color; Ctrl+wheel cycles colors. "
+                "Multi-selected rows are changed together from the RMB menu."
             )
         if column == 5 and node.kind in ("source", "graph"):
             return (
-                "Double-click to edit; Ctrl+wheel changes width by 0.5"
+                "Double-click to edit; Ctrl+wheel changes width by 0.5. "
+                "Use the RMB menu to apply one width to multiple rows."
             )
         if column in (3, 4) and node.kind in ("source", "graph"):
             return "Click the checkbox to change X selection or visibility"
         if column == 6 and node.kind in ("source", "graph"):
-            return "Double-click to choose line style and sample markers"
+            return (
+                "Double-click to choose line style and sample markers. "
+                "Use the RMB menu for multi-selected rows."
+            )
         if node.kind == "graph" and column == 3:
             return "Use this calculated graph's Y array as source X axis"
         return None
@@ -329,8 +358,10 @@ class FileGraphDelegate(QtWidgets.QStyledItemDelegate):
                 model.dataChanged.emit(index, index)
                 return True
         if event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
-            if index.column() in (2, 6):
-                payload = index.data(QtCore.Qt.ItemDataRole.UserRole)
-                model.action_requested.emit(payload, index.column())
+            payload = index.data(QtCore.Qt.ItemDataRole.UserRole)
+            if payload and payload[0] in ("source", "graph"):
+                model.action_requested.emit(payload, -1)
                 return True
+        if option is None:
+            option = QtWidgets.QStyleOptionViewItem()
         return super().editorEvent(event, model, option, index)

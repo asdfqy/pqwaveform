@@ -1,6 +1,7 @@
 """Main Qt6 waveform window with IPython, axes, markers, and graph controls."""
 
 from datetime import datetime
+from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters
@@ -19,6 +20,7 @@ from history_code_dialog import HistoryCodeDialog
 from ipython_console import IPythonConsole
 from marker_controller import MarkerController
 from models import ProjectModel
+from multi_selection_dialog import MultiSelectionDialog
 from palette_dialog import PaletteDialog
 from plot_theme import (
     apply_plot_appearance,
@@ -28,7 +30,7 @@ from plot_theme import (
 from plot_viewbox import AxisZoomViewBox
 from script_loader import UserScriptLoader
 from style_dialog import LineStyleDialog
-from tracking import IntersectionMarker, WaveformTracker
+from tracking import IntersectionMarker, PointMarker, WaveformTracker
 from tree_model import FileGraphDelegate, FileGraphTreeModel
 from ui_main_window import UiMainWindow
 
@@ -106,6 +108,8 @@ class TraceWidget(QtWidgets.QWidget):
         self.tid = tid
         self.items = []
         self.intersection_markers = []
+        self.point_markers = []
+        self.next_point_marker = 1
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.label = VerticalTraceLabel(model.traces[tid].name)
@@ -183,35 +187,32 @@ class TraceWidget(QtWidgets.QWidget):
             self.tid
         ):
             legend_name = style.legend_name or name
-            if style.line_style == 5:
-                item = self.plot.plot(
-                    x_values,
-                    y_values,
-                    pen=None,
-                    symbol="o",
-                    symbolSize=max(4.0, 2.5 * style.width),
-                    symbolPen=pg.mkPen(style.color, width=style.width),
-                    symbolBrush=pg.mkBrush(style.color),
-                )
-            else:
-                item = self.plot.plot(
-                    x_values,
-                    y_values,
-                    pen=pg.mkPen(
-                        style.color,
-                        width=style.width,
-                        style=PENS[style.line_style],
-                    ),
-                    symbol="o" if style.show_points else None,
-                    symbolSize=max(4.0, 2.5 * style.width),
-                    symbolPen=pg.mkPen(style.color, width=style.width),
-                    symbolBrush=pg.mkBrush(style.color),
-                )
+            pen = None if style.line_style == 5 else pg.mkPen(
+                style.color,
+                width=style.width,
+                style=PENS[style.line_style],
+            )
+            item = self.plot.plot(
+                x_values,
+                y_values,
+                pen=pen,
+                symbol=style.marker_symbol if style.show_points else None,
+                symbolSize=max(4.0, 2.5 * style.width),
+                symbolPen=pg.mkPen(style.color, width=style.width),
+                symbolBrush=pg.mkBrush(style.color),
+            )
+            item.setDownsampling(auto=True, method="peak")
             self.items.append(item)
             if legend is not None:
                 legend.addItem(item, legend_name)
         self.apply_plot_theme(trace.background)
         self.tracker.curves = self.items
+        for marker in self.point_markers:
+            marker.set_tracking(
+                self.items, trace.tracker_interpolation
+            )
+            marker.set_font_size(trace.marker_label_size)
+            marker.set_engineering(trace.engineering_axes)
         for marker in self.intersection_markers:
             marker.curves = self.items
             marker.set_font_size(trace.marker_label_size)
@@ -271,6 +272,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree_mode_index = 0
         self.skip_history_on_close = False
         self.last_selected_file_id = None
+        self.multi_selection = set()
+        self.multi_selection_start = None
         self._tree_refresh_pending = False
         self.tree_model = FileGraphTreeModel(self.model, self)
         self.tree_delegate = FileGraphDelegate(self.ui.file_tree)
@@ -288,6 +291,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def eventFilter(self, watched, event):
         """Handle documented Ctrl+wheel gestures in the file tree."""
         viewport = self.ui.file_tree.viewport()
+        if (
+            watched is viewport
+            and event.type() == QtCore.QEvent.Type.MouseButtonPress
+            and event.button() == QtCore.Qt.MouseButton.RightButton
+            and event.modifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        ):
+            index = self.ui.file_tree.indexAt(event.position().toPoint())
+            if index.isValid():
+                self.add_to_multi_selection(index)
+                event.accept()
+                return True
         if watched is viewport and event.type() == QtCore.QEvent.Type.Wheel:
             index = self.ui.file_tree.indexAt(event.position().toPoint())
             if index.isValid() and self.tree_delegate.editorEvent(
@@ -326,6 +341,7 @@ class MainWindow(QtWidgets.QMainWindow):
         m.tree_leaf_requested.connect(self.open_tree_leaf)
         m.marker_requested.connect(self.add_intersection_marker)
         u.open_action.triggered.connect(self.open_files)
+        u.open_advanced_action.triggered.connect(self.open_files_advanced)
         u.delete_file_action.triggered.connect(self.delete_file)
         u.clear_file_action.triggered.connect(self.delete_file)
         u.clear_all_files_action.triggered.connect(m.clear_all_files)
@@ -379,6 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         u.edit_legend_action.triggered.connect(self.edit_legend_names)
         u.marker_a_action.triggered.connect(lambda: self.marker("A"))
         u.marker_b_action.triggered.connect(lambda: self.marker("B"))
+        u.point_marker_action.triggered.connect(self.place_point_marker)
         u.clear_ab_action.triggered.connect(self.clear_ab_markers)
         u.clear_markers_action.triggered.connect(self.clear_all_markers)
         u.delete_marker_action.triggered.connect(self.delete_selected_marker)
@@ -412,6 +429,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def rebuild_traces(self):
         """Rebuild tab pages, plot widgets, and the active-tab trace table."""
         current_tab = self.model.active_tab_id
+        preserved = self.capture_view_state() if self.widgets else None
         tabs = self.ui.trace_tabs
         tabs.blockSignals(True)
         while tabs.count():
@@ -448,6 +466,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda t=tid: self.settings(t)
             )
             self.widgets[tid] = widget
+            widget.plot.viewport().installEventFilter(self)
+            widget.plot.viewport().setFocusPolicy(
+                QtCore.Qt.FocusPolicy.StrongFocus
+            )
             self.tab_views[trace.tab_id][1].addWidget(widget)
             widget.setMinimumHeight(90)
         active_index = self.model.tab_order.index(current_tab)
@@ -456,6 +478,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rebuild_trace_table()
         self.activate(self.model.active_trace_id)
         self.apply_links()
+        if preserved:
+            QtWidgets.QApplication.processEvents()
+            self.restore_view_state(preserved)
+        for tab_id in self.model.tab_order:
+            self.align_tab_axes(tab_id)
+
+    def align_tab_axes(self, tab_id=None):
+        """Align left and optional right axes for every trace in one tab."""
+        tab_id = self.model.active_tab_id if tab_id is None else tab_id
+        trace_ids = [
+            trace_id for trace_id in self.model.trace_order
+            if self.model.traces[trace_id].tab_id == tab_id
+            and trace_id in self.widgets
+        ]
+        if not trace_ids:
+            return
+        left_width = max(
+            self.widgets[trace_id].left.geometry().width()
+            for trace_id in trace_ids
+        )
+        left_width = max(35.0, float(left_width))
+        right_widths = []
+        for trace_id in trace_ids:
+            right = self.widgets[trace_id].plot.plotItem.getAxis("right")
+            if right is not None and right.isVisible():
+                right_widths.append(right.geometry().width())
+        right_width = max([35.0, *right_widths])
+        for trace_id in trace_ids:
+            widget = self.widgets[trace_id]
+            widget.left.setWidth(left_width)
+            right = widget.plot.plotItem.getAxis("right")
+            if right is not None and right.isVisible():
+                right.setWidth(right_width)
 
     def rebuild_trace_table(self):
         """Show trace controls for the currently active tab only."""
@@ -543,7 +598,29 @@ class MainWindow(QtWidgets.QMainWindow):
             title.setFlags(title.flags() | QtCore.Qt.ItemFlag.ItemIsEditable)
             title.setData(QtCore.Qt.ItemDataRole.UserRole, tid)
             table.setItem(row, 9, title)
-        for column in (1, 4, 5, 6, 7, 8):
+            options = QtWidgets.QToolButton()
+            options.setText("O")
+            options.setToolTip(
+                "Open display settings. Checked fields can be applied to "
+                "all traces in this tab."
+            )
+            options.clicked.connect(
+                lambda _checked=False, t=tid: self.settings(t)
+            )
+            table.setCellWidget(row, 10, options)
+            vertical_lock = QtWidgets.QCheckBox()
+            vertical_lock.setChecked(trace.vertical_marker_lock)
+            vertical_lock.setToolTip(
+                "Synchronize vertical markers by X coordinate across all "
+                "traces in this tab"
+            )
+            vertical_lock.toggled.connect(
+                lambda value, t=tid: self.option(
+                    t, vertical_marker_lock=value
+                )
+            )
+            table.setCellWidget(row, 11, vertical_lock)
+        for column in (1, 4, 5, 6, 7, 8, 10, 11):
             table.resizeColumnToContents(column)
         table.setColumnWidth(9, 220)
 
@@ -633,15 +710,23 @@ class MainWindow(QtWidgets.QMainWindow):
         trace_id = self.model.active_trace_id
         if trace_id not in self.model.traces:
             return
-        self.tree_model.rebuild(trace_id)
         tree = self.ui.file_tree
+        vertical_position = tree.verticalScrollBar().value()
+        horizontal_position = tree.horizontalScrollBar().value()
+        self.tree_model.rebuild(trace_id)
         state = self.current_tree_state()
         for row in range(self.tree_model.rowCount()):
             index = self.tree_model.index(row, 0)
             payload = index.data(QtCore.Qt.ItemDataRole.UserRole)
             tree.setFirstColumnSpanned(row, QtCore.QModelIndex(), True)
             tree.setExpanded(index, payload in state)
-
+        tree.verticalScrollBar().setValue(vertical_position)
+        tree.horizontalScrollBar().setValue(horizontal_position)
+        self.restore_multi_selection()
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: tree.verticalScrollBar().setValue(vertical_position),
+        )
     def rebuild_tree(self):
         """Compatibility entry point for a scheduled virtual-tree refresh."""
         self.schedule_tree_refresh()
@@ -702,16 +787,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if trace_id == self.model.active_trace_id:
             self.schedule_tree_refresh()
 
-    def tree_action(self, payload, column):
-        """Handle color and detailed line-style dialogs."""
-        if not payload or payload[0] not in ("source", "graph"):
-            return
+    def selected_style_payloads(self, payload):
+        """Return stable source/graph payloads targeted by style actions."""
+        targets = set(self.multi_selection)
+        if payload and payload[0] in ("source", "graph"):
+            targets.add(tuple(payload))
+        return [
+            target for target in targets
+            if target and target[0] in ("source", "graph")
+        ]
+
+    def style_for_payload(self, payload):
+        """Resolve one stable tree payload to its current style object."""
         if payload[0] == "source":
-            style = self.model.traces[self.model.active_trace_id].styles[
-                payload[1]
-            ][payload[2]]
-        else:
-            _, style = self.model.find_graph(payload[1])
+            trace = self.model.traces[self.model.active_trace_id]
+            return trace.styles[payload[1]][payload[2]]
+        return self.model.find_graph(payload[1])[1]
+
+    def apply_style_changes(self, payloads, changes):
+        """Apply one style edit to every selected source or graph row."""
+        for target in payloads:
+            try:
+                if target[0] == "source":
+                    self.model.set_column_style(
+                        target[1], target[2], **changes
+                    )
+                else:
+                    self.model.set_graph_style(target[1], **changes)
+            except (KeyError, ValueError):
+                continue
+
+    def tree_action(self, payload, column):
+        """Apply color or line-style dialogs to selected tree rows."""
+        payloads = self.selected_style_payloads(payload)
+        if not payloads:
+            return
+        if column == -1:
+            self.open_multi_selection_dialog(payload)
+            return
+        style = self.style_for_payload(payloads[0])
         if column == 2:
             dialog = PaletteDialog(self.model.palette, self)
             if not dialog.exec():
@@ -719,21 +833,19 @@ class MainWindow(QtWidgets.QMainWindow):
             changes = {"color": dialog.selected_color}
         elif column == 6:
             dialog = LineStyleDialog(
-                style.line_style, style.show_points, self
+                style.line_style, style.show_points, style.marker_symbol, self
             )
             if not dialog.exec():
                 return
-            line_style, show_points = dialog.values()
+            line_style, show_points, marker_symbol = dialog.values()
             changes = {
                 "line_style": line_style,
                 "show_points": show_points,
+                "marker_symbol": marker_symbol,
             }
         else:
             return
-        if payload[0] == "source":
-            self.model.set_column_style(payload[1], payload[2], **changes)
-        else:
-            self.model.set_graph_style(payload[1], **changes)
+        self.apply_style_changes(payloads, changes)
 
     def add_tab(self):
         """Create a new tab and its first trace atomically."""
@@ -782,9 +894,22 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         dialog = DisplaySettingsDialog(self.model.traces[tid], self)
         if dialog.exec():
-            for k, v in dialog.values().items():
-                setattr(self.model.traces[tid], k, v)
-            self.model.trace_changed.emit(tid)
+            values, shared = dialog.values()
+            for key, value in values.items():
+                setattr(self.model.traces[tid], key, value)
+            affected = {tid}
+            tab_id = self.model.traces[tid].tab_id
+            for trace_id in self.model.trace_order:
+                trace = self.model.traces[trace_id]
+                if trace.tab_id != tab_id or trace_id == tid:
+                    continue
+                for key in shared:
+                    setattr(trace, key, values[key])
+                if shared:
+                    affected.add(trace_id)
+            for trace_id in affected:
+                self.model.trace_changed.emit(trace_id)
+            self.rebuild_trace_table()
 
     def marker(self, name):
         """Place marker in active trace."""
@@ -819,6 +944,89 @@ class MainWindow(QtWidgets.QMainWindow):
         trace.tracker_interpolation = not trace.tracker_interpolation
         self.model.trace_changed.emit(trace.uid)
 
+    def place_point_marker(self):
+        """Place the next numbered marker at the active trace cursor."""
+        trace_id = self.model.active_trace_id
+        widget = self.widgets.get(trace_id)
+        if widget is None:
+            return
+        position = widget.last_mouse_position
+        if position is None:
+            x_range, y_range = widget.plot.viewRange()
+            x_value = sum(x_range) / 2.0
+            y_value = sum(y_range) / 2.0
+        else:
+            x_value, y_value = float(position.x()), float(position.y())
+        marker = PointMarker(
+            widget.plot,
+            widget.next_point_marker,
+            x_value,
+            y_value,
+            widget.items,
+            self.model.traces[trace_id].tracker_interpolation,
+        )
+        marker.set_font_size(
+            self.model.traces[trace_id].marker_label_size
+        )
+        marker.set_engineering(
+            self.model.traces[trace_id].engineering_axes
+        )
+        widget.next_point_marker += 1
+        widget.point_markers.append(marker)
+
+    def add_point_marker(self, trace_id, state):
+        """Restore one numbered point marker and its label state."""
+        widget = self.widgets.get(trace_id)
+        if widget is None:
+            return
+        number = int(state.get("number", widget.next_point_marker))
+        position = state.get("position", [0.0, 0.0])
+        trace = self.model.traces[trace_id]
+        marker = PointMarker(
+            widget.plot,
+            number,
+            *position,
+            widget.items,
+            trace.tracker_interpolation,
+        )
+        marker.set_font_size(trace.marker_label_size)
+        label = state.get("label")
+        if label:
+            marker.label.setPos(*label)
+        marker.label.set_alignment(state.get("alignment", "left"))
+        marker.set_engineering(trace.engineering_axes)
+        widget.point_markers.append(marker)
+        widget.next_point_marker = max(widget.next_point_marker, number + 1)
+
+    def synchronize_vertical_marker(self, source_trace, marker):
+        """Mirror one vertical marker's X coordinate to locked peer traces."""
+        source = self.model.traces.get(source_trace)
+        if source is None or not source.vertical_marker_lock:
+            return
+        for trace_id in self.model.trace_order:
+            trace = self.model.traces[trace_id]
+            if (
+                trace_id == source_trace
+                or trace.tab_id != source.tab_id
+                or not trace.vertical_marker_lock
+                or trace_id not in self.widgets
+            ):
+                continue
+            widget = self.widgets[trace_id]
+            linked = getattr(marker, "linked_markers", {})
+            peer = linked.get(trace_id)
+            if peer not in widget.intersection_markers:
+                peer = self.create_intersection_marker(
+                    "v", marker.value, trace_id, synchronize=False
+                )
+                linked[trace_id] = peer
+                peer.linked_markers = linked
+                marker.linked_markers = linked
+            peer.line.blockSignals(True)
+            peer.line.setValue(marker.value)
+            peer.line.blockSignals(False)
+            peer.update()
+
     def place_intersection_marker(self, orientation):
         """Place an intersection marker immediately near the mouse cursor."""
         trace_id = self.model.active_trace_id
@@ -832,9 +1040,17 @@ class MainWindow(QtWidgets.QMainWindow):
         function(value, trace=trace_id)
 
     def add_intersection_marker(self, orientation, value, trace_id):
-        """Create a movable line and labels at every curve crossing."""
+        """Create a marker and synchronize locked vertical peer traces."""
+        return self.create_intersection_marker(
+            orientation, value, trace_id, synchronize=True
+        )
+
+    def create_intersection_marker(
+        self, orientation, value, trace_id, synchronize=True
+    ):
+        """Create one intersection marker and optionally mirror it."""
         if trace_id not in self.widgets:
-            return
+            return None
         widget = self.widgets[trace_id]
         marker = IntersectionMarker(
             widget.plot, orientation, value, widget.items
@@ -845,6 +1061,15 @@ class MainWindow(QtWidgets.QMainWindow):
         marker.set_text_theme(foreground_for(trace.background))
         widget.marker_controller.add_marker(marker)
         widget.intersection_markers.append(marker)
+        marker.linked_markers = {trace_id: marker}
+        if orientation == "v":
+            marker.line.sigPositionChanged.connect(
+                lambda _line=None, t=trace_id, m=marker:
+                self.synchronize_vertical_marker(t, m)
+            )
+            if synchronize:
+                self.synchronize_vertical_marker(trace_id, marker)
+        return marker
 
     @staticmethod
     def remove_intersection_marker(widget, marker):
@@ -869,6 +1094,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if widget is None:
             return
         widget.tracker.clear()
+        for marker in list(widget.point_markers):
+            marker.remove()
+        widget.point_markers.clear()
+        widget.next_point_marker = 1
         for marker in list(widget.intersection_markers):
             self.remove_intersection_marker(widget, marker)
 
@@ -931,6 +1160,134 @@ class MainWindow(QtWidgets.QMainWindow):
         if file_id is not None:
             self.model.set_file_columns_visible(file_id, visible)
 
+    @staticmethod
+    def payload_from_index(index):
+        """Return a stable payload for one tree row."""
+        value = index.data(QtCore.Qt.ItemDataRole.UserRole)
+        return tuple(value) if value else None
+
+    def restore_multi_selection(self):
+        """Restore visual rows from stable payloads after model resets."""
+        self.tree_model.set_multi_selection(self.multi_selection)
+        selection = self.ui.file_tree.selectionModel()
+        flag = QtCore.QItemSelectionModel.SelectionFlag.Select
+        rows = QtCore.QItemSelectionModel.SelectionFlag.Rows
+        for group_row in range(self.tree_model.rowCount()):
+            parent = self.tree_model.index(group_row, 0)
+            for row in range(self.tree_model.rowCount(parent)):
+                index = self.tree_model.index(row, 0, parent)
+                if self.payload_from_index(index) in self.multi_selection:
+                    selection.select(index, flag | rows)
+
+    def add_to_multi_selection(self, index):
+        """Add one source or graph row without clearing earlier ranges."""
+        payload = self.payload_from_index(index)
+        if payload and payload[0] in ("source", "graph"):
+            self.multi_selection.add(payload)
+            self.restore_multi_selection()
+
+    def start_multi_selection(self, index):
+        """Remember the first row of a range selection."""
+        self.multi_selection_start = QtCore.QPersistentModelIndex(index)
+        self.add_to_multi_selection(index)
+
+    def stop_multi_selection(self, index):
+        """Add an inclusive range; multiple ranges may be accumulated."""
+        start = self.multi_selection_start
+        if start is None or not start.isValid():
+            self.add_to_multi_selection(index)
+            return
+        if start.parent() != index.parent():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Multi-selection",
+                "Start and stop must belong to the same file or graph group.",
+            )
+            return
+        parent = index.parent()
+        first, last = sorted((start.row(), index.row()))
+        for row in range(first, last + 1):
+            current = self.tree_model.index(row, 0, parent)
+            payload = self.payload_from_index(current)
+            if payload and payload[0] in ("source", "graph"):
+                self.multi_selection.add(payload)
+        self.multi_selection_start = None
+        self.restore_multi_selection()
+
+    def clear_multi_selection(self):
+        """Clear every accumulated multi-selection range."""
+        self.multi_selection.clear()
+        self.multi_selection_start = None
+        self.tree_model.set_multi_selection(set())
+        self.ui.file_tree.clearSelection()
+
+    def open_multi_selection_dialog(self, payload):
+        """Edit every persistent selected row in one self-contained dialog."""
+        targets = self.selected_style_payloads(payload)
+        if not targets:
+            return
+        styles = []
+        valid_targets = []
+        for target in targets:
+            try:
+                styles.append(self.style_for_payload(target))
+                valid_targets.append(target)
+            except (KeyError, ValueError):
+                continue
+        if not styles:
+            return
+        graph_count = sum(target[0] == "graph" for target in valid_targets)
+        dialog = MultiSelectionDialog(
+            self.model, styles, graph_count, self
+        )
+        dialog.apply_button.clicked.connect(
+            lambda: self.apply_style_changes(valid_targets, dialog.changes())
+        )
+        dialog.enable_y.clicked.connect(
+            lambda: self.set_selected_y_visible(payload, True)
+        )
+        dialog.disable_y.clicked.connect(
+            lambda: self.set_selected_y_visible(payload, False)
+        )
+        dialog.delete_graphs.clicked.connect(
+            lambda: self.delete_selected_graphs(payload)
+        )
+        dialog.exec()
+
+    def delete_selected_graphs(self, payload):
+        """Delete every calculated graph in the persistent selection."""
+        targets = self.selected_style_payloads(payload)
+        graph_ids = [item[1] for item in targets if item[0] == "graph"]
+        for graph_id in graph_ids:
+            self.model.remove_graph(graph_id)
+        self.multi_selection.difference_update(
+            ("graph", graph_id) for graph_id in graph_ids
+        )
+        self.restore_multi_selection()
+
+    def set_selected_y_visible(self, payload, visible):
+        """Enable or disable Y display for all selected source/graph rows."""
+        for target in self.selected_style_payloads(payload):
+            try:
+                if target[0] == "source":
+                    self.model.set_y_column(target[1], target[2], visible)
+                elif target[0] == "graph":
+                    self.model.set_graph_style(target[1], visible=visible)
+            except (KeyError, ValueError):
+                continue
+
+    def set_selected_line_width(self, payload):
+        """Prompt once and apply line width to all selected rows."""
+        targets = self.selected_style_payloads(payload)
+        if not targets:
+            return
+        current = float(self.style_for_payload(targets[0]).width)
+        value, accepted = QtWidgets.QInputDialog.getDouble(
+            self, "Line width", "Width:", current, 0.5, 100.0, 1
+        )
+        if accepted:
+            self.apply_style_changes(targets, {"width": value})
+
     def file_tree_context_menu(self, position):
         """Show graph save/delete and source bulk-visibility actions."""
         index = self.ui.file_tree.indexAt(position)
@@ -938,6 +1295,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if not payload:
             return
         menu = QtWidgets.QMenu(self)
+        menu.addAction(
+            "Add to multi-selection",
+            lambda: self.add_to_multi_selection(index),
+        )
+        menu.addAction(
+            "Start multi-selection",
+            lambda: self.start_multi_selection(index),
+        )
+        menu.addAction(
+            "Stop multi-selection",
+            lambda: self.stop_multi_selection(index),
+        )
+        menu.addAction(
+            "Clear multi-selection", self.clear_multi_selection
+        )
+        if payload[0] in ("source", "graph"):
+            menu.addSeparator()
+            menu.addAction(
+                "Edit multi-selection...",
+                lambda: self.open_multi_selection_dialog(payload),
+            )
+        menu.addSeparator()
         if payload[0] == "graph":
             graph_id = payload[1]
             trace_id, graph = self.model.find_graph(graph_id)
@@ -1011,12 +1390,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def capture_view_state(self):
         """Capture ranges, markers, labels, legends, and splitter sizes."""
         traces = {}
-        for trace_id, widget in self.widgets.items():
+        for trace_id, widget in list(self.widgets.items()):
+            trace = self.model.traces.get(trace_id)
+            if trace is None or trace.tab_id not in self.tab_views:
+                continue
             tracker = widget.tracker
             traces[str(trace_id)] = {
                 "range": widget.plot.viewRange(),
                 "splitter": self.tab_views[
-                    self.model.traces[trace_id].tab_id
+                    trace.tab_id
                 ][1].sizes(),
                 "ab_points": tracker.points,
                 "ab_labels": {
@@ -1032,6 +1414,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ],
                 "measurement_group": tracker.helper_state(),
                 "legend_pos": self._legend_position(widget),
+                "point_markers": [
+                    marker.state() for marker in widget.point_markers
+                ],
                 "markers": [
                     {
                         "orientation": item.orientation,
@@ -1155,6 +1540,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 lambda w=widget, pos=legend_position:
                 self._restore_legend_position(w, pos),
             )
+            for point_marker in values.get("point_markers", []):
+                self.add_point_marker(trace_id, point_marker)
             for marker in values.get("markers", []):
                 self.add_intersection_marker(
                     marker["orientation"], marker["value"], trace_id
@@ -1171,13 +1558,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         label.setPos(*saved)
 
-    def history_entry(self, name, description):
-        """Build one complete named history entry."""
+    def history_entry(
+        self, name, description, history_filename=DEFAULT_HISTORY
+    ):
+        """Build one complete named history entry with portable paths."""
+        history_directory = Path(history_filename).expanduser().resolve().parent
         return {
             "name": name or datetime.now().strftime("State %Y-%m-%d %H:%M"),
             "description": description,
             "saved": datetime.now().isoformat(timespec="seconds"),
-            "model": capture_model(self.model),
+            "model": capture_model(
+                self.model, history_directory
+            ),
             "view": self.capture_view_state(),
         }
 
@@ -1194,15 +1586,31 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         dialog = HistoryDialog(entries, commands, traces, self)
         result = dialog.exec()
+        entries = dialog.entries
+        if dialog.entries_changed:
+            write_entries(entries, filename)
         if result == HistoryDialog.SAVE_CURRENT:
             entry = self.history_entry(
                 dialog.name.text(),
                 dialog.description.toPlainText(),
+                filename,
             )
             entry["ipython_code"] = dialog.selected_code()
             entry["python_sections"] = dialog.code_sections()
             entries.append(entry)
             write_entries(entries, filename)
+        elif result == HistoryDialog.OVERWRITE_SELECTED:
+            index = dialog.selected_index
+            if index is not None:
+                entry = self.history_entry(
+                    dialog.name.text(),
+                    dialog.description.toPlainText(),
+                    filename,
+                )
+                entry["ipython_code"] = dialog.selected_code()
+                entry["python_sections"] = dialog.code_sections()
+                entries[index] = entry
+                write_entries(entries, filename)
         elif result == HistoryDialog.DELETE_SELECTED:
             selected = set(dialog.selected_indices)
             entries = [
@@ -1213,7 +1621,7 @@ class MainWindow(QtWidgets.QMainWindow):
             write_entries(entries, filename)
         elif result and dialog.selected_index is not None:
             entry = entries[dialog.selected_index]
-            restore_model(self.model, entry["model"])
+            history_directory = Path(filename).expanduser().resolve().parent
             sections = entry.get("python_sections")
             if sections is None:
                 legacy = entry.get("ipython_code", "")
@@ -1229,30 +1637,70 @@ class MainWindow(QtWidgets.QMainWindow):
             has_code = has_code or any(
                 code.strip() for code in sections.get("traces", {}).values()
             )
+            build_saved_traces = True
+            reviewed_sections = sections
+            run_code = False
             if has_code:
-                names = {
-                    trace_id: trace.name
-                    for trace_id, trace in self.model.traces.items()
+                saved_names = {
+                    int(trace["uid"]): trace.get("name", "")
+                    for trace in entry["model"].get("traces", [])
                 }
-                code_dialog = HistoryCodeDialog(sections, names, self)
+                code_dialog = HistoryCodeDialog(
+                    sections, saved_names, self
+                )
                 if code_dialog.exec() == HistoryCodeDialog.RUN_CODE:
-                    self.run_history_code(code_dialog.reviewed_sections())
-            self.restore_calculated_graph_styles(entry["model"])
+                    run_code = True
+                    reviewed_sections = code_dialog.reviewed_sections()
+                    build_saved_traces = code_dialog.restore_saved_traces()
+            restore_model(
+                self.model,
+                entry["model"],
+                history_directory,
+                build_saved_traces=build_saved_traces,
+            )
+            if run_code and not build_saved_traces:
+                self.restore_history_aliases(entry["model"])
+            if run_code:
+                self.run_history_code(
+                    reviewed_sections,
+                    map_saved_traces=not build_saved_traces,
+                    saved_order=entry["model"].get("trace_order", []),
+                )
+            trace_mapping = self.map_saved_traces(entry["model"])
+            if not build_saved_traces:
+                self.restore_generated_trace_metadata(
+                    entry["model"], trace_mapping
+                )
+            self.restore_calculated_graph_styles(
+                entry["model"], trace_mapping
+            )
             view_state = entry.get("view", {})
+            if trace_mapping:
+                view_state = dict(view_state)
+                view_state["traces"] = {
+                    str(trace_mapping.get(int(key), int(key))): value
+                    for key, value in view_state.get("traces", {}).items()
+                }
             self.restore_gui_state(view_state)
             self.rebuild_traces()
             QtWidgets.QApplication.processEvents()
             self.restore_view_state(view_state)
 
-    def restore_calculated_graph_styles(self, model_state):
-        """Apply stored metadata after Python recreated calculated graphs."""
+    def restore_calculated_graph_styles(
+        self, model_state, trace_mapping=None
+    ):
+        """Apply stored graph metadata through an optional trace mapping."""
+        trace_mapping = trace_mapping or {}
         saved_traces = {
             int(trace["uid"]): trace
             for trace in model_state.get("traces", [])
         }
         alias_changed = False
-        for trace_id, trace in self.model.traces.items():
-            saved_trace = saved_traces.get(trace_id)
+        for saved_id, saved_trace in saved_traces.items():
+            trace_id = trace_mapping.get(saved_id, saved_id)
+            trace = self.model.traces.get(trace_id)
+            if trace is None:
+                continue
             if saved_trace is None:
                 continue
             by_name = {}
@@ -1279,6 +1727,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 graph.show_points = bool(
                     saved.get("show_points", graph.show_points)
                 )
+                graph.marker_symbol = str(
+                    saved.get("marker_symbol", graph.marker_symbol)
+                )
                 graph.legend_name = str(
                     saved.get("legend_name", graph.legend_name)
                 )
@@ -1302,18 +1753,103 @@ class MainWindow(QtWidgets.QMainWindow):
             return candidates[occurrence]
         return None
 
-    def run_history_code(self, sections):
-        """Run setup once, then trace-owned code with each trace active."""
+    def restore_history_aliases(self, model_state):
+        """Publish saved source aliases before history Python executes."""
+        saved_files = model_state.get("files", [])
+        current_files = list(self.model.files)
+        file_mapping = {
+            int(item["uid"]): current_id
+            for item, current_id in zip(saved_files, current_files)
+        }
+        saved_traces = model_state.get("traces", [])
+        if not saved_traces or not self.model.trace_order:
+            return
+        target = self.model.traces[self.model.trace_order[0]]
+        for old_file, columns in saved_traces[0].get("styles", {}).items():
+            current_file = file_mapping.get(int(old_file))
+            if current_file not in target.styles:
+                continue
+            for column, values in columns.items():
+                style = target.styles[current_file].get(int(column))
+                if style is not None:
+                    style.alias = str(values.get("alias", ""))
+        self.model.aliases_changed.emit()
+
+    def map_saved_traces(self, model_state):
+        """Map saved traces to current traces by unique name, then order."""
+        saved = model_state.get("traces", [])
+        current_ids = list(self.model.trace_order)
+        unused = set(current_ids)
+        mapping = {}
+        for position, item in enumerate(saved):
+            saved_id = int(item["uid"])
+            name_matches = [
+                trace_id for trace_id in unused
+                if self.model.traces[trace_id].name == item.get("name")
+            ]
+            if len(name_matches) == 1:
+                target = name_matches[0]
+            elif position < len(current_ids):
+                target = current_ids[position]
+            elif unused:
+                target = next(iter(unused))
+            else:
+                continue
+            mapping[saved_id] = target
+            unused.discard(target)
+        return mapping
+
+    def restore_generated_trace_metadata(self, model_state, mapping):
+        """Apply saved display and source styles to Python-generated traces."""
+        excluded = {"uid", "styles", "graphs", "graph_styles", "tab_id"}
+        file_ids = list(self.model.files)
+        saved_file_ids = [item["uid"] for item in model_state.get("files", [])]
+        file_mapping = dict(zip(saved_file_ids, file_ids))
+        for saved in model_state.get("traces", []):
+            target_id = mapping.get(int(saved["uid"]))
+            trace = self.model.traces.get(target_id)
+            if trace is None:
+                continue
+            for key, value in saved.items():
+                if key not in excluded and hasattr(trace, key):
+                    setattr(trace, key, value)
+            for old_file, columns in saved.get("styles", {}).items():
+                current_file = file_mapping.get(int(old_file))
+                if current_file not in trace.styles:
+                    continue
+                for column, values in columns.items():
+                    style = trace.styles[current_file].get(int(column))
+                    if style is None:
+                        continue
+                    for key, value in values.items():
+                        if hasattr(style, key):
+                            setattr(style, key, value)
+
+    def run_history_code(
+        self, sections, map_saved_traces=False, saved_order=None
+    ):
+        """Run setup and trace code, optionally against generated traces."""
         shell = self.console.kernel_manager.kernel.shell
         before = sections.get("before_traces", "")
         try:
             if before.strip():
                 shell.run_cell(before, store_history=True)
-            for trace_id in self.model.trace_order:
-                code = sections.get("traces", {}).get(str(trace_id), "")
+            trace_sections = sections.get("traces", {})
+            if map_saved_traces:
+                order = list(saved_order or [])
+                section_ids = order or [int(key) for key in trace_sections]
+            else:
+                section_ids = list(self.model.trace_order)
+            for position, saved_id in enumerate(section_ids):
+                code = trace_sections.get(str(saved_id), "")
                 if not code.strip():
                     continue
-                self.model.set_active_trace(trace_id)
+                current_order = list(self.model.trace_order)
+                if map_saved_traces:
+                    target = current_order[min(position, len(current_order) - 1)]
+                else:
+                    target = saved_id
+                self.model.set_active_trace(target)
                 shell.run_cell(code, store_history=True)
         except Exception as error:
             QtWidgets.QMessageBox.warning(self, "History code", str(error))
@@ -1329,7 +1865,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def autosave_history(self):
         """Append the closing state to the default history file."""
         entries = read_entries(DEFAULT_HISTORY)
-        entry = self.history_entry("Last session", "Automatic save")
+        entry = self.history_entry(
+            "Last session", "Automatic save", DEFAULT_HISTORY
+        )
         commands = self.console.command_history()
         commands.extend(self.script_loader.audit_log)
         entry["ipython_code"] = commands
@@ -1347,6 +1885,27 @@ class MainWindow(QtWidgets.QMainWindow):
         from help_dialog import HelpDialog
 
         HelpDialog(self).exec()
+
+    def open_files_advanced(self):
+        """Choose files and always review parsing settings with a preview."""
+        names, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Open advanced", "", "Data files (*);;All (*)"
+        )
+        for name in names:
+            self.open_advanced_file(name)
+
+    def open_advanced_file(self, name):
+        """Preview and load one file with explicitly reviewed settings."""
+        from import_dialog import AdvancedImportDialog
+        dialog = AdvancedImportDialog(self.model.options, name, self)
+        if not dialog.exec():
+            return
+        try:
+            for key, value in dialog.values().items():
+                setattr(self.model.options, key, value)
+            self.model.load_file(name)
+        except Exception as error:
+            QtWidgets.QMessageBox.warning(self, "Open advanced", str(error))
 
     def open_files(self):
         """Open source files."""
@@ -1486,11 +2045,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if segment is None:
                 continue
             x0, y0, x1, y1 = segment
-            if clipped_x:
+            contiguous = (
+                clipped_x
+                and np.isfinite(clipped_x[-1])
+                and np.isclose(clipped_x[-1], x0)
+                and np.isclose(clipped_y[-1], y0)
+            )
+            if not contiguous and clipped_x:
                 clipped_x.append(np.nan)
                 clipped_y.append(np.nan)
-            clipped_x.extend((x0, x1))
-            clipped_y.extend((y0, y1))
+            if contiguous:
+                clipped_x.append(x1)
+                clipped_y.append(y1)
+            else:
+                clipped_x.extend((x0, x1))
+                clipped_y.extend((y0, y1))
         return np.asarray(clipped_x), np.asarray(clipped_y)
 
     @classmethod
@@ -1587,6 +2156,11 @@ class MainWindow(QtWidgets.QMainWindow):
         rendered = []
         width = 0
         height = 0
+        selected_tabs = {
+            self.model.traces[trace_id].tab_id for trace_id in trace_ids
+        }
+        for tab_id in selected_tabs:
+            self.align_tab_axes(tab_id)
         for trace_id in trace_ids:
             widget = self.widgets[trace_id]
             original = self.model.traces[trace_id].background

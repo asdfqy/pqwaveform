@@ -17,6 +17,7 @@ LINE_STYLES = {
     "dash": 2,
     "dot": 3,
     "dash-dot": 4,
+    "none": 5,
     "points": 5,
     "points-only": 5,
 }
@@ -31,9 +32,10 @@ class Style:
     is_y: bool = False
     alias: str = ""
     color: Any = (0, 170, 255, 255)
-    width: float = 1.5
+    width: float = 1.0
     line_style: int = 1
     show_points: bool = False
+    marker_symbol: str = "o"
     legend_name: str = ""
 
 
@@ -62,10 +64,11 @@ class Graph:
     y: np.ndarray
     alias: str = ""
     color: Any = (255, 170, 0, 255)
-    width: float = 1.5
+    width: float = 1.0
     line_style: int = 1
     visible: bool = True
     show_points: bool = False
+    marker_symbol: str = "o"
     legend_name: str = ""
 
 
@@ -90,16 +93,17 @@ class Trace:
     engineering_axes: bool = True
     axis_label_size: int = 10
     axis_tick_size: int = 9
-    marker_label_size: int = 8
+    marker_label_size: int = 10
     marker_offset: float = 0.04
     tab_id: int = 0
     x_graph_id: int | None = None
     title: str = ""
     legend_visible: bool = False
-    legend_font_size: int = 9
+    legend_font_size: int = 10
     tracker_interpolation: bool = False
     marker_mode: str = "horizontal"
     background: str = "black"
+    vertical_marker_lock: bool = False
 
 
 class ProjectModel(QtCore.QObject):
@@ -409,7 +413,7 @@ class ProjectModel(QtCore.QObject):
 
     def _initialize_styles(self, trace, file_id) -> None:
         data_file = self.files[file_id]
-        width = max(0.5, float(self.options.linewidth or 1.5))
+        width = max(0.5, float(self.options.linewidth or 1.0))
         line_style = max(1, min(5, int(self.options.linestyle or 1)))
         trace.styles[file_id] = {
             column: Style(
@@ -423,9 +427,6 @@ class ProjectModel(QtCore.QObject):
             trace.styles[file_id][
                 min(self.options.xcolumn, len(data_file.labels) - 1)
             ].is_x = True
-        for column in self.options.ycolumn:
-            if column < len(data_file.labels):
-                trace.styles[file_id][column].is_y = True
 
     def remove_file(self, file_id: int) -> bool:
         if file_id not in self.files:
@@ -555,6 +556,7 @@ class ProjectModel(QtCore.QObject):
             "width",
             "line_style",
             "show_points",
+            "marker_symbol",
             "legend_name",
             "is_x",
             "is_y",
@@ -627,7 +629,7 @@ class ProjectModel(QtCore.QObject):
         if number not in LINE_STYLES.values():
             raise ValueError(
                 "Line style must be 1..5 or one of solid, dash, "
-                "dot, dash-dot, or points."
+                "dot, dash-dot, or none."
             )
         return number
 
@@ -639,7 +641,7 @@ class ProjectModel(QtCore.QObject):
         trace=None,
         alias="",
         color=None,
-        width=1.5,
+        width=1.0,
         style=1,
         visible=True,
     ) -> Graph:
@@ -742,6 +744,7 @@ class ProjectModel(QtCore.QObject):
             "line_style",
             "visible",
             "show_points",
+            "marker_symbol",
             "legend_name",
         }
         unknown = set(changes) - allowed
